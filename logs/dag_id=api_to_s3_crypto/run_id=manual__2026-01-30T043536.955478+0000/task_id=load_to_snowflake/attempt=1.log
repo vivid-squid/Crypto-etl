@@ -1,0 +1,420 @@
+[2026-01-30T04:35:42.353+0000] {local_task_job_runner.py:120} INFO - ::group::Pre task execution logs
+[2026-01-30T04:35:42.366+0000] {taskinstance.py:2076} INFO - Dependencies all met for dep_context=non-requeueable deps ti=<TaskInstance: api_to_s3_crypto.load_to_snowflake manual__2026-01-30T04:35:36.955478+00:00 [queued]>
+[2026-01-30T04:35:42.373+0000] {taskinstance.py:2076} INFO - Dependencies all met for dep_context=requeueable deps ti=<TaskInstance: api_to_s3_crypto.load_to_snowflake manual__2026-01-30T04:35:36.955478+00:00 [queued]>
+[2026-01-30T04:35:42.374+0000] {taskinstance.py:2306} INFO - Starting attempt 1 of 1
+[2026-01-30T04:35:42.382+0000] {taskinstance.py:2330} INFO - Executing <Task(SnowflakeOperator): load_to_snowflake> on 2026-01-30 04:35:36.955478+00:00
+[2026-01-30T04:35:42.392+0000] {logging_mixin.py:188} WARNING - /home/***/.local/lib/python3.12/site-packages/***/task/task_runner/standard_task_runner.py:62 DeprecationWarning: This process (pid=2113) is multi-threaded, use of fork() may lead to deadlocks in the child.
+[2026-01-30T04:35:42.394+0000] {standard_task_runner.py:64} INFO - Started process 2116 to run task
+[2026-01-30T04:35:42.392+0000] {standard_task_runner.py:90} INFO - Running: ['***', 'tasks', 'run', 'api_to_s3_crypto', 'load_to_snowflake', 'manual__2026-01-30T04:35:36.955478+00:00', '--job-id', '61', '--raw', '--subdir', 'DAGS_FOLDER/api_to_s3.py', '--cfg-path', '/tmp/tmpbe4f230n']
+[2026-01-30T04:35:42.395+0000] {standard_task_runner.py:91} INFO - Job 61: Subtask load_to_snowflake
+[2026-01-30T04:35:42.453+0000] {task_command.py:426} INFO - Running <TaskInstance: api_to_s3_crypto.load_to_snowflake manual__2026-01-30T04:35:36.955478+00:00 [running]> on host 873606956bc0
+[2026-01-30T04:35:42.527+0000] {taskinstance.py:2648} INFO - Exporting env vars: AIRFLOW_CTX_DAG_OWNER='***' AIRFLOW_CTX_DAG_ID='api_to_s3_crypto' AIRFLOW_CTX_TASK_ID='load_to_snowflake' AIRFLOW_CTX_EXECUTION_DATE='2026-01-30T04:35:36.955478+00:00' AIRFLOW_CTX_TRY_NUMBER='1' AIRFLOW_CTX_DAG_RUN_ID='manual__2026-01-30T04:35:36.955478+00:00'
+[2026-01-30T04:35:42.528+0000] {taskinstance.py:430} INFO - ::endgroup::
+[2026-01-30T04:35:42.538+0000] {sql.py:282} INFO - Executing: 
+
+/* ============================================================
+   STEP 0 — Context (Role / Warehouse / DB / Schema)
+   ============================================================ */
+USE ROLE ACCOUNTADMIN;
+
+CREATE OR REPLACE WAREHOUSE ETL_WH
+  WAREHOUSE_SIZE = XSMALL
+  AUTO_SUSPEND   = 60
+  AUTO_RESUME    = TRUE;
+
+CREATE OR REPLACE DATABASE CRYPTO_DB;
+CREATE OR REPLACE SCHEMA CRYPTO_DB.RAW;
+
+USE WAREHOUSE ETL_WH;
+USE DATABASE CRYPTO_DB;
+USE SCHEMA RAW;
+
+
+/* ============================================================
+   STEP 1 — Storage Integration (Snowflake <-> AWS IAM Role)
+   NOTE: This assumes your IAM Role trust policy is already set
+         using the values from:
+         DESC INTEGRATION s3_crypto_int;
+   ============================================================ 
+CREATE OR REPLACE STORAGE INTEGRATION s3_crypto_int
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::911337539817:role/snowflake_s3_crypto_role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://test-for-etl-proj/raw/');
+
+-- Verify Snowflake generated IAM user ARN + external ID
+DESC INTEGRATION s3_crypto_int;
+*/
+
+/* ============================================================
+   STEP 2 — File Format + External Stage (points to S3)
+   IMPORTANT: Keep trailing slash in URL to match allowed location
+   ============================================================ */
+CREATE OR REPLACE FILE FORMAT crypto_json_ff
+  TYPE = JSON;
+
+CREATE OR REPLACE STAGE s3_crypto_stage
+  STORAGE_INTEGRATION = s3_crypto_int
+  URL = 's3://test-for-etl-proj/raw/'
+  FILE_FORMAT = crypto_json_ff;
+
+--SHOW STAGES IN SCHEMA CRYPTO_DB.RAW;
+
+-- Verify Snowflake can see the files
+LIST @s3_crypto_stage/api/;
+
+
+/* ============================================================
+   STEP 3 — Raw Landing Table (keeps original JSON)
+   ============================================================ */
+CREATE OR REPLACE TABLE crypto_prices_raw (
+  file_name STRING,
+  load_ts   TIMESTAMP_NTZ,
+  payload   VARIANT
+);
+
+
+/* ============================================================
+   STEP 4 — Load from S3 into Raw Table (COPY INTO)
+   - FORCE=TRUE re-loads even if Snowflake thinks it was loaded
+   - PATTERN ensures only crypto_prices_*.json are loaded
+   ============================================================ */
+COPY INTO crypto_prices_raw (file_name, load_ts, payload)
+FROM (
+  SELECT
+    METADATA$FILENAME,
+    CURRENT_TIMESTAMP(),
+    $1
+  FROM @s3_crypto_stage/api/
+)
+PATTERN = '.*crypto_prices_.*\.json'
+FORCE = TRUE;
+
+-- Quick sanity check (latest loaded rows)
+SELECT
+  file_name,
+  load_ts,
+  payload:extracted_at::timestamp_ntz AS extracted_at,
+  payload:data:bitcoin:usd::number    AS btc_usd,
+  payload:data:ethereum:usd::number   AS eth_usd
+FROM crypto_prices_raw
+ORDER BY load_ts DESC
+LIMIT 10;
+
+
+/* ============================================================
+   STEP 5 — Deduplicate Raw (keep latest load per file_name)
+   ============================================================ */
+DELETE FROM crypto_prices_raw
+WHERE (file_name, load_ts) IN (
+  SELECT file_name, load_ts
+  FROM (
+    SELECT
+      file_name,
+      load_ts,
+      ROW_NUMBER() OVER (PARTITION BY file_name ORDER BY load_ts DESC) AS rn
+    FROM crypto_prices_raw
+  )
+  WHERE rn > 1
+);
+
+-- Confirm no duplicates remain
+SELECT file_name, COUNT(*) AS cnt
+FROM crypto_prices_raw
+GROUP BY file_name
+ORDER BY cnt DESC;
+
+
+/* ============================================================
+   STEP 6 — Analytics Table (flatten JSON into columns)
+   (This makes Tableau work much more smoothly.)
+   ============================================================ */
+CREATE OR REPLACE TABLE crypto_prices_analytics AS
+SELECT
+  payload:extracted_at::timestamp_ntz AS extracted_at,
+  payload:data:bitcoin:usd::number    AS btc_usd,
+  payload:data:ethereum:usd::number   AS eth_usd,
+  file_name,
+  load_ts
+FROM crypto_prices_raw;
+
+SELECT *
+FROM crypto_prices_analytics
+ORDER BY extracted_at DESC
+LIMIT 10;
+
+
+/* ============================================================
+   STEP 7 — Tableau-friendly VIEW (latest per extracted_at)
+   - Prevents duplicates if same extracted_at loads again
+   - Tableau should connect to this view
+   ============================================================ */
+CREATE OR REPLACE VIEW vw_crypto_prices_latest AS
+SELECT
+  extracted_at,
+  btc_usd,
+  eth_usd
+FROM crypto_prices_analytics
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY extracted_at
+  ORDER BY load_ts DESC
+) = 1;
+
+SELECT * FROM vw_crypto_prices_latest
+ORDER BY extracted_at DESC
+LIMIT 20;
+
+
+/* ============================================================
+   OPTIONAL — Environment checks
+   ============================================================ */
+SELECT CURRENT_ACCOUNT(), CURRENT_REGION();
+
+
+
+CREATE OR REPLACE VIEW CRYPTO_DB.RAW.VW_CRYPTO_PRICES_HISTORY AS
+SELECT
+  extracted_at,
+  btc_usd,
+  eth_usd
+FROM CRYPTO_DB.RAW.CRYPTO_PRICES_ANALYTICS
+ORDER BY extracted_at;
+[2026-01-30T04:35:42.549+0000] {base.py:84} INFO - Using connection ID 'snowflake_default' for task execution.
+[2026-01-30T04:35:42.561+0000] {base.py:84} INFO - Using connection ID 'snowflake_default' for task execution.
+[2026-01-30T04:35:42.562+0000] {connection.py:408} INFO - Snowflake Connector for Python Version: 3.11.0, Python Version: 3.12.4, Platform: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.36
+[2026-01-30T04:35:42.563+0000] {connection.py:1258} INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+[2026-01-30T04:35:43.321+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:43.321+0000] {sql.py:495} INFO - Running statement: /* ============================================================
+   STEP 0 — Context (Role / Warehouse / DB / Schema)
+   ============================================================ */
+USE ROLE ACCOUNTADMIN;, parameters: None
+[2026-01-30T04:35:43.439+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:43.440+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:43.440+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:43.440+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e3200010206
+[2026-01-30T04:35:43.441+0000] {sql.py:495} INFO - Running statement: CREATE OR REPLACE WAREHOUSE ETL_WH
+  WAREHOUSE_SIZE = XSMALL
+  AUTO_SUSPEND   = 60
+  AUTO_RESUME    = TRUE;, parameters: None
+[2026-01-30T04:35:43.663+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:43.663+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:43.663+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:43.664+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2bd
+[2026-01-30T04:35:43.664+0000] {sql.py:495} INFO - Running statement: CREATE OR REPLACE DATABASE CRYPTO_DB;, parameters: None
+[2026-01-30T04:35:43.848+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:43.849+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:43.850+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:43.850+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e320001020a
+[2026-01-30T04:35:43.850+0000] {sql.py:495} INFO - Running statement: CREATE OR REPLACE SCHEMA CRYPTO_DB.RAW;, parameters: None
+[2026-01-30T04:35:44.013+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:44.014+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:44.014+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:44.014+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2c1
+[2026-01-30T04:35:44.014+0000] {sql.py:495} INFO - Running statement: USE WAREHOUSE ETL_WH;, parameters: None
+[2026-01-30T04:35:44.169+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:44.169+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:44.170+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:44.170+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e320001020e
+[2026-01-30T04:35:44.170+0000] {sql.py:495} INFO - Running statement: USE DATABASE CRYPTO_DB;, parameters: None
+[2026-01-30T04:35:44.248+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:44.249+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:44.250+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:44.250+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e3200010212
+[2026-01-30T04:35:44.251+0000] {sql.py:495} INFO - Running statement: USE SCHEMA RAW;, parameters: None
+[2026-01-30T04:35:44.328+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:44.329+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:44.329+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:44.330+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e3200010216
+[2026-01-30T04:35:44.330+0000] {sql.py:495} INFO - Running statement: /* ============================================================
+   STEP 1 — Storage Integration (Snowflake <-> AWS IAM Role)
+   NOTE: This assumes your IAM Role trust policy is already set
+         using the values from:
+         DESC INTEGRATION s3_crypto_int;
+   ============================================================ 
+CREATE OR REPLACE STORAGE INTEGRATION s3_crypto_int
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::911337539817:role/snowflake_s3_crypto_role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://test-for-etl-proj/raw/');
+
+-- Verify Snowflake generated IAM user ARN + external ID
+DESC INTEGRATION s3_crypto_int;
+*/
+
+/* ============================================================
+   STEP 2 — File Format + External Stage (points to S3)
+   IMPORTANT: Keep trailing slash in URL to match allowed location
+   ============================================================ */
+CREATE OR REPLACE FILE FORMAT crypto_json_ff
+  TYPE = JSON;, parameters: None
+[2026-01-30T04:35:44.571+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:44.571+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:44.572+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:44.572+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2c5
+[2026-01-30T04:35:44.572+0000] {sql.py:495} INFO - Running statement: CREATE OR REPLACE STAGE s3_crypto_stage
+  STORAGE_INTEGRATION = s3_crypto_int
+  URL = 's3://test-for-etl-proj/raw/'
+  FILE_FORMAT = crypto_json_ff;, parameters: None
+[2026-01-30T04:35:44.745+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:44.746+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:44.746+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:44.747+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2c9
+[2026-01-30T04:35:44.747+0000] {sql.py:495} INFO - Running statement: --SHOW STAGES IN SCHEMA CRYPTO_DB.RAW;
+
+-- Verify Snowflake can see the files
+LIST @s3_crypto_stage/api/;, parameters: None
+[2026-01-30T04:35:45.072+0000] {cursor.py:1149} INFO - Number of results in first chunk: 27
+[2026-01-30T04:35:45.073+0000] {sql.py:504} INFO - Rows affected: 27
+[2026-01-30T04:35:45.073+0000] {snowflake.py:422} INFO - Rows affected: 27
+[2026-01-30T04:35:45.074+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2cd
+[2026-01-30T04:35:45.074+0000] {sql.py:495} INFO - Running statement: /* ============================================================
+   STEP 3 — Raw Landing Table (keeps original JSON)
+   ============================================================ */
+CREATE OR REPLACE TABLE crypto_prices_raw (
+  file_name STRING,
+  load_ts   TIMESTAMP_NTZ,
+  payload   VARIANT
+);, parameters: None
+[2026-01-30T04:35:45.252+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:45.253+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:45.253+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:45.253+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2d1
+[2026-01-30T04:35:45.254+0000] {sql.py:495} INFO - Running statement: /* ============================================================
+   STEP 4 — Load from S3 into Raw Table (COPY INTO)
+   - FORCE=TRUE re-loads even if Snowflake thinks it was loaded
+   - PATTERN ensures only crypto_prices_*.json are loaded
+   ============================================================ */
+COPY INTO crypto_prices_raw (file_name, load_ts, payload)
+FROM (
+  SELECT
+    METADATA$FILENAME,
+    CURRENT_TIMESTAMP(),
+    $1
+  FROM @s3_crypto_stage/api/
+)
+PATTERN = '.*crypto_prices_.*\.json'
+FORCE = TRUE;, parameters: None
+[2026-01-30T04:35:47.541+0000] {cursor.py:1149} INFO - Number of results in first chunk: 27
+[2026-01-30T04:35:47.541+0000] {sql.py:504} INFO - Rows affected: 27
+[2026-01-30T04:35:47.541+0000] {snowflake.py:422} INFO - Rows affected: 27
+[2026-01-30T04:35:47.542+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e320001021a
+[2026-01-30T04:35:47.542+0000] {sql.py:495} INFO - Running statement: -- Quick sanity check (latest loaded rows)
+SELECT
+  file_name,
+  load_ts,
+  payload:extracted_at::timestamp_ntz AS extracted_at,
+  payload:data:bitcoin:usd::number    AS btc_usd,
+  payload:data:ethereum:usd::number   AS eth_usd
+FROM crypto_prices_raw
+ORDER BY load_ts DESC
+LIMIT 10;, parameters: None
+[2026-01-30T04:35:47.883+0000] {cursor.py:1149} INFO - Number of results in first chunk: 10
+[2026-01-30T04:35:47.883+0000] {sql.py:504} INFO - Rows affected: 10
+[2026-01-30T04:35:47.884+0000] {snowflake.py:422} INFO - Rows affected: 10
+[2026-01-30T04:35:47.884+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2d5
+[2026-01-30T04:35:47.885+0000] {sql.py:495} INFO - Running statement: /* ============================================================
+   STEP 5 — Deduplicate Raw (keep latest load per file_name)
+   ============================================================ */
+DELETE FROM crypto_prices_raw
+WHERE (file_name, load_ts) IN (
+  SELECT file_name, load_ts
+  FROM (
+    SELECT
+      file_name,
+      load_ts,
+      ROW_NUMBER() OVER (PARTITION BY file_name ORDER BY load_ts DESC) AS rn
+    FROM crypto_prices_raw
+  )
+  WHERE rn > 1
+);, parameters: None
+[2026-01-30T04:35:48.117+0000] {sql.py:504} INFO - Rows affected: 0
+[2026-01-30T04:35:48.118+0000] {snowflake.py:422} INFO - Rows affected: 0
+[2026-01-30T04:35:48.118+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e320001021e
+[2026-01-30T04:35:48.118+0000] {sql.py:495} INFO - Running statement: -- Confirm no duplicates remain
+SELECT file_name, COUNT(*) AS cnt
+FROM crypto_prices_raw
+GROUP BY file_name
+ORDER BY cnt DESC;, parameters: None
+[2026-01-30T04:35:48.240+0000] {cursor.py:1149} INFO - Number of results in first chunk: 27
+[2026-01-30T04:35:48.241+0000] {sql.py:504} INFO - Rows affected: 27
+[2026-01-30T04:35:48.241+0000] {snowflake.py:422} INFO - Rows affected: 27
+[2026-01-30T04:35:48.242+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2d9
+[2026-01-30T04:35:48.242+0000] {sql.py:495} INFO - Running statement: /* ============================================================
+   STEP 6 — Analytics Table (flatten JSON into columns)
+   (This makes Tableau work much more smoothly.)
+   ============================================================ */
+CREATE OR REPLACE TABLE crypto_prices_analytics AS
+SELECT
+  payload:extracted_at::timestamp_ntz AS extracted_at,
+  payload:data:bitcoin:usd::number    AS btc_usd,
+  payload:data:ethereum:usd::number   AS eth_usd,
+  file_name,
+  load_ts
+FROM crypto_prices_raw;, parameters: None
+[2026-01-30T04:35:49.051+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:49.051+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:49.051+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:49.052+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e3200010222
+[2026-01-30T04:35:49.052+0000] {sql.py:495} INFO - Running statement: SELECT *
+FROM crypto_prices_analytics
+ORDER BY extracted_at DESC
+LIMIT 10;, parameters: None
+[2026-01-30T04:35:49.224+0000] {cursor.py:1149} INFO - Number of results in first chunk: 10
+[2026-01-30T04:35:49.224+0000] {sql.py:504} INFO - Rows affected: 10
+[2026-01-30T04:35:49.225+0000] {snowflake.py:422} INFO - Rows affected: 10
+[2026-01-30T04:35:49.225+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2dd
+[2026-01-30T04:35:49.225+0000] {sql.py:495} INFO - Running statement: /* ============================================================
+   STEP 7 — Tableau-friendly VIEW (latest per extracted_at)
+   - Prevents duplicates if same extracted_at loads again
+   - Tableau should connect to this view
+   ============================================================ */
+CREATE OR REPLACE VIEW vw_crypto_prices_latest AS
+SELECT
+  extracted_at,
+  btc_usd,
+  eth_usd
+FROM crypto_prices_analytics
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY extracted_at
+  ORDER BY load_ts DESC
+) = 1;, parameters: None
+[2026-01-30T04:35:49.398+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:49.398+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:49.398+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:49.399+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2e1
+[2026-01-30T04:35:49.399+0000] {sql.py:495} INFO - Running statement: SELECT * FROM vw_crypto_prices_latest
+ORDER BY extracted_at DESC
+LIMIT 20;, parameters: None
+[2026-01-30T04:35:49.577+0000] {cursor.py:1149} INFO - Number of results in first chunk: 20
+[2026-01-30T04:35:49.577+0000] {sql.py:504} INFO - Rows affected: 20
+[2026-01-30T04:35:49.578+0000] {snowflake.py:422} INFO - Rows affected: 20
+[2026-01-30T04:35:49.578+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e3200010226
+[2026-01-30T04:35:49.579+0000] {sql.py:495} INFO - Running statement: /* ============================================================
+   OPTIONAL — Environment checks
+   ============================================================ */
+SELECT CURRENT_ACCOUNT(), CURRENT_REGION();, parameters: None
+[2026-01-30T04:35:49.637+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:49.637+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:49.638+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:49.638+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb7c-0000-00034e32f2e5
+[2026-01-30T04:35:49.638+0000] {sql.py:495} INFO - Running statement: CREATE OR REPLACE VIEW CRYPTO_DB.RAW.VW_CRYPTO_PRICES_HISTORY AS
+SELECT
+  extracted_at,
+  btc_usd,
+  eth_usd
+FROM CRYPTO_DB.RAW.CRYPTO_PRICES_ANALYTICS
+ORDER BY extracted_at;, parameters: None
+[2026-01-30T04:35:49.782+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:49.783+0000] {sql.py:504} INFO - Rows affected: 1
+[2026-01-30T04:35:49.784+0000] {snowflake.py:422} INFO - Rows affected: 1
+[2026-01-30T04:35:49.784+0000] {snowflake.py:423} INFO - Snowflake query id: 01c211f3-0108-fb52-0003-4e320001022a
+[2026-01-30T04:35:49.907+0000] {cursor.py:1149} INFO - Number of results in first chunk: 1
+[2026-01-30T04:35:49.907+0000] {connection.py:773} INFO - closed
+[2026-01-30T04:35:49.993+0000] {connection.py:779} INFO - No async queries seem to be running, deleting session
+[2026-01-30T04:35:50.082+0000] {taskinstance.py:441} INFO - ::group::Post task execution logs
+[2026-01-30T04:35:50.104+0000] {taskinstance.py:1206} INFO - Marking task as SUCCESS. dag_id=api_to_s3_crypto, task_id=load_to_snowflake, run_id=manual__2026-01-30T04:35:36.955478+00:00, execution_date=20260130T043536, start_date=20260130T043542, end_date=20260130T043550
+[2026-01-30T04:35:50.152+0000] {local_task_job_runner.py:243} INFO - Task exited with return code 0
+[2026-01-30T04:35:50.165+0000] {taskinstance.py:3503} INFO - 0 downstream tasks scheduled from follow-on schedule check
+[2026-01-30T04:35:50.167+0000] {local_task_job_runner.py:222} INFO - ::endgroup::

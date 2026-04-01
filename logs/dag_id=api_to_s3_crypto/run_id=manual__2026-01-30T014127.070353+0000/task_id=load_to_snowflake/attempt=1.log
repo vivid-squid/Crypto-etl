@@ -1,0 +1,245 @@
+[2026-01-30T01:41:33.654+0000] {local_task_job_runner.py:120} INFO - ::group::Pre task execution logs
+[2026-01-30T01:41:33.667+0000] {taskinstance.py:2076} INFO - Dependencies all met for dep_context=non-requeueable deps ti=<TaskInstance: api_to_s3_crypto.load_to_snowflake manual__2026-01-30T01:41:27.070353+00:00 [queued]>
+[2026-01-30T01:41:33.673+0000] {taskinstance.py:2076} INFO - Dependencies all met for dep_context=requeueable deps ti=<TaskInstance: api_to_s3_crypto.load_to_snowflake manual__2026-01-30T01:41:27.070353+00:00 [queued]>
+[2026-01-30T01:41:33.674+0000] {taskinstance.py:2306} INFO - Starting attempt 1 of 1
+[2026-01-30T01:41:33.684+0000] {taskinstance.py:2330} INFO - Executing <Task(SnowflakeOperator): load_to_snowflake> on 2026-01-30 01:41:27.070353+00:00
+[2026-01-30T01:41:33.694+0000] {logging_mixin.py:188} WARNING - /home/***/.local/lib/python3.12/site-packages/***/task/task_runner/standard_task_runner.py:62 DeprecationWarning: This process (pid=231) is multi-threaded, use of fork() may lead to deadlocks in the child.
+[2026-01-30T01:41:33.693+0000] {standard_task_runner.py:90} INFO - Running: ['***', 'tasks', 'run', 'api_to_s3_crypto', 'load_to_snowflake', 'manual__2026-01-30T01:41:27.070353+00:00', '--job-id', '23', '--raw', '--subdir', 'DAGS_FOLDER/api_to_s3.py', '--cfg-path', '/tmp/tmp_ot3iys6']
+[2026-01-30T01:41:33.695+0000] {standard_task_runner.py:64} INFO - Started process 234 to run task
+[2026-01-30T01:41:33.696+0000] {standard_task_runner.py:91} INFO - Job 23: Subtask load_to_snowflake
+[2026-01-30T01:41:33.755+0000] {task_command.py:426} INFO - Running <TaskInstance: api_to_s3_crypto.load_to_snowflake manual__2026-01-30T01:41:27.070353+00:00 [running]> on host 873606956bc0
+[2026-01-30T01:41:33.832+0000] {taskinstance.py:2648} INFO - Exporting env vars: AIRFLOW_CTX_DAG_OWNER='***' AIRFLOW_CTX_DAG_ID='api_to_s3_crypto' AIRFLOW_CTX_TASK_ID='load_to_snowflake' AIRFLOW_CTX_EXECUTION_DATE='2026-01-30T01:41:27.070353+00:00' AIRFLOW_CTX_TRY_NUMBER='1' AIRFLOW_CTX_DAG_RUN_ID='manual__2026-01-30T01:41:27.070353+00:00'
+[2026-01-30T01:41:33.833+0000] {taskinstance.py:430} INFO - ::endgroup::
+[2026-01-30T01:41:33.844+0000] {sql.py:282} INFO - Executing: 
+
+/* ============================================================
+   STEP 0 — Context (Role / Warehouse / DB / Schema)
+   ============================================================ */
+USE ROLE ACCOUNTADMIN;
+
+CREATE OR REPLACE WAREHOUSE ETL_WH
+  WAREHOUSE_SIZE = XSMALL
+  AUTO_SUSPEND   = 60
+  AUTO_RESUME    = TRUE;
+
+CREATE OR REPLACE DATABASE CRYPTO_DB;
+CREATE OR REPLACE SCHEMA CRYPTO_DB.RAW;
+
+USE WAREHOUSE ETL_WH;
+USE DATABASE CRYPTO_DB;
+USE SCHEMA RAW;
+
+
+/* ============================================================
+   STEP 1 — Storage Integration (Snowflake <-> AWS IAM Role)
+   NOTE: This assumes your IAM Role trust policy is already set
+         using the values from:
+         DESC INTEGRATION s3_crypto_int;
+   ============================================================ */
+CREATE OR REPLACE STORAGE INTEGRATION s3_crypto_int
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::911337539817:role/snowflake_s3_crypto_role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://test-for-etl-proj/raw/');
+
+-- Verify Snowflake generated IAM user ARN + external ID
+DESC INTEGRATION s3_crypto_int;
+
+
+/* ============================================================
+   STEP 2 — File Format + External Stage (points to S3)
+   IMPORTANT: Keep trailing slash in URL to match allowed location
+   ============================================================ */
+CREATE OR REPLACE FILE FORMAT crypto_json_ff
+  TYPE = JSON;
+
+CREATE OR REPLACE STAGE s3_crypto_stage
+  STORAGE_INTEGRATION = s3_crypto_int
+  URL = 's3://test-for-etl-proj/raw/'
+  FILE_FORMAT = crypto_json_ff;
+
+-- Verify Snowflake can see the files
+LIST @s3_crypto_stage/api/;
+
+
+/* ============================================================
+   STEP 3 — Raw Landing Table (keeps original JSON)
+   ============================================================ */
+CREATE OR REPLACE TABLE crypto_prices_raw (
+  file_name STRING,
+  load_ts   TIMESTAMP_NTZ,
+  payload   VARIANT
+);
+
+
+/* ============================================================
+   STEP 4 — Load from S3 into Raw Table (COPY INTO)
+   - FORCE=TRUE re-loads even if Snowflake thinks it was loaded
+   - PATTERN ensures only crypto_prices_*.json are loaded
+   ============================================================ */
+COPY INTO crypto_prices_raw (file_name, load_ts, payload)
+FROM (
+  SELECT
+    METADATA$FILENAME,
+    CURRENT_TIMESTAMP(),
+    $1
+  FROM @s3_crypto_stage/api/
+)
+PATTERN = '.*crypto_prices_.*\.json'
+FORCE = TRUE;
+
+-- Quick sanity check (latest loaded rows)
+SELECT
+  file_name,
+  load_ts,
+  payload:extracted_at::timestamp_ntz AS extracted_at,
+  payload:data:bitcoin:usd::number    AS btc_usd,
+  payload:data:ethereum:usd::number   AS eth_usd
+FROM crypto_prices_raw
+ORDER BY load_ts DESC
+LIMIT 10;
+
+
+/* ============================================================
+   STEP 5 — Deduplicate Raw (keep latest load per file_name)
+   ============================================================ */
+DELETE FROM crypto_prices_raw
+WHERE (file_name, load_ts) IN (
+  SELECT file_name, load_ts
+  FROM (
+    SELECT
+      file_name,
+      load_ts,
+      ROW_NUMBER() OVER (PARTITION BY file_name ORDER BY load_ts DESC) AS rn
+    FROM crypto_prices_raw
+  )
+  WHERE rn > 1
+);
+
+-- Confirm no duplicates remain
+SELECT file_name, COUNT(*) AS cnt
+FROM crypto_prices_raw
+GROUP BY file_name
+ORDER BY cnt DESC;
+
+
+/* ============================================================
+   STEP 6 — Analytics Table (flatten JSON into columns)
+   (This makes Tableau work much more smoothly.)
+   ============================================================ */
+CREATE OR REPLACE TABLE crypto_prices_analytics AS
+SELECT
+  payload:extracted_at::timestamp_ntz AS extracted_at,
+  payload:data:bitcoin:usd::number    AS btc_usd,
+  payload:data:ethereum:usd::number   AS eth_usd,
+  file_name,
+  load_ts
+FROM crypto_prices_raw;
+
+SELECT *
+FROM crypto_prices_analytics
+ORDER BY extracted_at DESC
+LIMIT 10;
+
+
+/* ============================================================
+   STEP 7 — Tableau-friendly VIEW (latest per extracted_at)
+   - Prevents duplicates if same extracted_at loads again
+   - Tableau should connect to this view
+   ============================================================ */
+CREATE OR REPLACE VIEW vw_crypto_prices_latest AS
+SELECT
+  extracted_at,
+  btc_usd,
+  eth_usd
+FROM crypto_prices_analytics
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY extracted_at
+  ORDER BY load_ts DESC
+) = 1;
+
+SELECT * FROM vw_crypto_prices_latest
+ORDER BY extracted_at DESC
+LIMIT 20;
+
+
+/* ============================================================
+   OPTIONAL — Environment checks
+   ============================================================ */
+SELECT CURRENT_ACCOUNT(), CURRENT_REGION();
+
+
+
+
+[2026-01-30T01:41:33.856+0000] {base.py:84} INFO - Using connection ID 'snowflake_default' for task execution.
+[2026-01-30T01:41:33.869+0000] {base.py:84} INFO - Using connection ID 'snowflake_default' for task execution.
+[2026-01-30T01:41:33.871+0000] {connection.py:408} INFO - Snowflake Connector for Python Version: 3.11.0, Python Version: 3.12.4, Platform: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.36
+[2026-01-30T01:41:33.871+0000] {connection.py:1258} INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+[2026-01-30T01:41:34.526+0000] {taskinstance.py:441} INFO - ::group::Post task execution logs
+[2026-01-30T01:41:34.526+0000] {taskinstance.py:2905} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File "/home/airflow/.local/lib/python3.12/site-packages/airflow/models/taskinstance.py", line 465, in _execute_task
+    result = _execute_callable(context=context, **execute_callable_kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/airflow/models/taskinstance.py", line 432, in _execute_callable
+    return execute_callable(context=context, **execute_callable_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/airflow/models/baseoperator.py", line 401, in wrapper
+    return func(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/airflow/providers/common/sql/operators/sql.py", line 288, in execute
+    output = hook.run(
+             ^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/airflow/providers/snowflake/hooks/snowflake.py", line 404, in run
+    with closing(self.get_conn()) as conn:
+                 ^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/airflow/providers/snowflake/hooks/snowflake.py", line 300, in get_conn
+    conn = connector.connect(**conn_config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/__init__.py", line 55, in Connect
+    return SnowflakeConnection(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/connection.py", line 451, in __init__
+    self.connect(**kwargs)
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/connection.py", line 756, in connect
+    self.__open_connection()
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/connection.py", line 1084, in __open_connection
+    self.authenticate_with_retry(self.auth_class)
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/connection.py", line 1364, in authenticate_with_retry
+    self._authenticate(auth_instance)
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/connection.py", line 1392, in _authenticate
+    auth.authenticate(
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/auth/_auth.py", line 250, in authenticate
+    ret = self._rest._post_request(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/network.py", line 734, in _post_request
+    ret = self.fetch(
+          ^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/network.py", line 843, in fetch
+    ret = self._request_exec_wrapper(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/network.py", line 979, in _request_exec_wrapper
+    raise e
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/network.py", line 884, in _request_exec_wrapper
+    return_object = self._request_exec(
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/network.py", line 1193, in _request_exec
+    raise err
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/network.py", line 1135, in _request_exec
+    raise_failed_request_error(
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/network.py", line 238, in raise_failed_request_error
+    Error.errorhandler_wrapper(
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/errors.py", line 290, in errorhandler_wrapper
+    handed_over = Error.hand_to_other_handler(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/errors.py", line 348, in hand_to_other_handler
+    connection.errorhandler(connection, cursor, error_class, error_value)
+  File "/home/airflow/.local/lib/python3.12/site-packages/snowflake/connector/errors.py", line 221, in default_errorhandler
+    raise error_class(
+snowflake.connector.errors.InterfaceError: 250003 (08001): None: 404 Not Found: post https://MU79737.snowflakecomputing.com:443/session/v1/login-request?request_id=b9f805ed-20f1-4418-b9fc-84a67dc517a3&databaseName=CRYPTO_DB&schemaName=RAW&warehouse=ETL_WH&roleName=ACCOUNTADMIN&request_guid=b4daaabc-4024-4391-aaf9-a2af4ee57a5b
+[2026-01-30T01:41:34.536+0000] {taskinstance.py:1206} INFO - Marking task as FAILED. dag_id=api_to_s3_crypto, task_id=load_to_snowflake, run_id=manual__2026-01-30T01:41:27.070353+00:00, execution_date=20260130T014127, start_date=20260130T014133, end_date=20260130T014134
+[2026-01-30T01:41:34.545+0000] {standard_task_runner.py:110} ERROR - Failed to execute job 23 for task load_to_snowflake (250003 (08001): None: 404 Not Found: post https://MU79737.snowflakecomputing.com:443/session/v1/login-request?request_id=b9f805ed-20f1-4418-b9fc-84a67dc517a3&databaseName=CRYPTO_DB&schemaName=RAW&warehouse=ETL_WH&roleName=ACCOUNTADMIN&request_guid=b4daaabc-4024-4391-aaf9-a2af4ee57a5b; 234)
+[2026-01-30T01:41:34.591+0000] {local_task_job_runner.py:243} INFO - Task exited with return code 1
+[2026-01-30T01:41:34.606+0000] {taskinstance.py:3503} INFO - 0 downstream tasks scheduled from follow-on schedule check
+[2026-01-30T01:41:34.607+0000] {local_task_job_runner.py:222} INFO - ::endgroup::
