@@ -41,16 +41,6 @@ CoinGecko API → Airflow → S3 (raw JSON) → Snowflake (RAW → ANALYTICS) �
  - Verify data in S3 and Snowflake
 
 
-## Security Note
-
-Do NOT commit:
-- AWS credentials  
-- Snowflake passwords  
-- `.env` or `.aws` files  
-
-Use environment variables or Airflow connections instead.
-
-
 ## Future Improvements
 
 - Incremental loading (remove full reloads)  
